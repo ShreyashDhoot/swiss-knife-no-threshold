@@ -14,9 +14,9 @@ Usage:
         --output-dir tribunal/inputs
 
     # Step 2: Plot existing tribunal results (after running tribunal separately)
-    python evaluation/prepare_tribunal_eval.py --mode plot 
-        --inputs-dir tribunal/inputs 
-        --results-dir tribunal/eval_results
+    python evaluation/prepare_tribunal_eval.py --mode plot \\
+        --inputs-dir tribunal/inputs \\
+        --results-dir tribunal/eval_results \\
         --plot-dir runs/tribunal_plots
 """
 
