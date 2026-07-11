@@ -256,7 +256,7 @@ class SwissKnifeConfig:
         assert self.elo_rounds >= 1, f"elo_rounds must be ≥ 1, got {self.elo_rounds}"
         _valid_gen_modes = (
             "option_a", "option_b",
-            "gsi_softmax", "gsi_pairwise", "gsi_swiss", "gsi_elo", "gsi_gumbel","gsi_elo_no_th","gsi_swiss_no_th","gsi_softmax_no_th"
+            "gsi_softmax", "gsi_pairwise", "gsi_swiss", "gsi_elo", "gsi_gumbel","gsi_elo_no_th","gsi_swiss_no_th","gsi_softmax_no_th","gsi_swiss_no_match","gsi_elo_no_match","normal_spec_3b_7b" ,"normal_spec_3b_blade"
         )
         assert self.generation_mode in _valid_gen_modes, \
             f"generation_mode must be one of {_valid_gen_modes}, got '{self.generation_mode}'"

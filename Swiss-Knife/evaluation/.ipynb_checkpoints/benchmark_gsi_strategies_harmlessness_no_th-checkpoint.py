@@ -19,13 +19,30 @@ Harmlessness-focused GSI benchmark that:
       whatever downstream judge metric (GEval, AQI, etc.) you add later.
 
 Strategies tested:
-    1. gsi_softmax_no_th         — Standard GSI: softmax(β·r̃) selection with thresholding 
+    1. gsi_softmax_no_th          — Standard GSI: softmax(β·r̃) selection with thresholding
     2. gsi_swiss_no_th            — Swiss-system → points table → softmax (no thresholding and resampling)
     3. gsi_elo_no_th              — Elo-system tournament selection (no thresholding and resampling)
+    4. gsi_swiss_no_match         — Swiss-system tournament decided directly on tilted reward
+                                     (matches use tilted reward, not separate draft/blade scores)
+    5. gsi_elo_no_match           — Elo tournament decided directly on tilted reward
+                                     (matches use tilted reward, not separate draft/blade scores)
+
+Baselines (no GSI tournament, added for head-to-head comparison):
+    6. baseline_qwen3b            — Plain Qwen 2.5 3B generator, no blade, no speculative decoding.
+    7. baseline_qwen7b            — Plain Qwen 2.5 7B generator, no blade, no speculative decoding.
+    8. normal_spec_3b_7b          — Vanilla speculative decoding: Qwen 3B drafts, Qwen 7B verifies.
+                                     No blade in the accept/reject loop.
+    9. normal_spec_3b_blade       — Vanilla speculative decoding: Qwen 3B drafts, the harmlessness
+                                     Blade (LoRA adapter on the 7B) acts as the verifier.
+                                     No GSI tournament — the blade is just the target model
+                                     in a standard speculative-decoding accept/reject rule.
 
 Run:
     python evaluation/benchmark_gsi_strategies_harmlessness_no_th.py \\
         --strategies gsi_softmax_no_th gsi_swiss_no_th gsi_elo_no_th \\
+                     gsi_swiss_no_match gsi_elo_no_match \\
+                     baseline_qwen3b baseline_qwen7b \\
+                     normal_spec_3b_7b normal_spec_3b_blade \\
         --num-prompts 100 \\
         --gsi-n 8 \\
         --beta 0.1 \\
@@ -64,6 +81,9 @@ from Model_mechanics.blades import DPOBlade
 from Model_mechanics.gsi_softmax_no_th import GSISoftmaxGenerator
 from Model_mechanics.gsi_swiss_no_th import GSISwissGenerator
 from Model_mechanics.gsi_elo_no_th import GSIEloGenerator
+from Model_mechanics.gsi_swiss_no_match import GSISwissGenerator as GSISwissNoMatchGenerator
+from Model_mechanics.gsi_elo_no_match import GSIEloGenerator as GSIEloNoMatchGenerator
+from Model_mechanics.baseline_generators import PlainGenerator, NormalSpeculativeGenerator
 
 
 
@@ -210,10 +230,10 @@ def run_single_strategy(
         rewards_so_far = [r["blade_reward"] for r in all_responses]
         avg_reward = sum(rewards_so_far) / len(rewards_so_far)
         refusals_so_far = sum(1 for r in all_responses if r["refusal_heuristic"])
-        
+
         override_rates_so_far = [r["override_rate"] for r in all_responses if r["override_rate"] is not None]
         avg_override = sum(override_rates_so_far) / len(override_rates_so_far) if override_rates_so_far else 0.0
-        
+
         logger.info(
             "[%s] %d/%d | avg_blade_reward=%.5f | last_blade_reward=%.5f | refusals_so_far=%d | avg_override=%.4f",
             strategy_name, idx + 1, len(test_prompts), avg_reward, blade_reward, refusals_so_far, avg_override,
@@ -256,8 +276,8 @@ def parse_args():
     p.add_argument("--gsi-tau", type=float, default=1.0)
     p.add_argument("--swiss-rounds", type=int, default=6)
     p.add_argument("--elo-rounds", type=int, default=6)
-    p.add_argument("--elo-temperature", type=float, default=15.0)
-    p.add_argument("--gsi-max-step-tokens", type=int, default=20)
+    p.add_argument("--elo-temperature", type=float, default=13.75)
+    p.add_argument("--gsi-max-step-tokens", type=int, default=70)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dtype", type=str, default="bfloat16",
                     choices=["float16", "bfloat16", "float32"])
@@ -268,14 +288,22 @@ def parse_args():
     p.add_argument(
         "--strategies", type=str, nargs="+",
         default=["gsi_softmax_no_th", "gsi_swiss_no_th", "gsi_elo_no_th"],
-        choices=["gsi_softmax_no_th", "gsi_swiss_no_th", "gsi_elo_no_th"],
+        choices=[
+            "gsi_softmax_no_th", "gsi_swiss_no_th", "gsi_elo_no_th",
+            "gsi_swiss_no_match", "gsi_elo_no_match",
+            "baseline_qwen3b", "baseline_qwen7b",
+            "normal_spec_3b_7b", "normal_spec_3b_blade",
+        ],
         help="Which strategies to benchmark.",
     )
     # gsi_gumbel-specific args
     p.add_argument("--gamma", type=int, default=4,
-                    help="Speculative lookahead depth (gsi_gumbel only, default: 4).")
+                    help="Speculative lookahead depth (gsi_gumbel / normal_spec_* only, default: 4).")
     p.add_argument("--K", type=int, default=8,
                     help="Candidates per position (gsi_gumbel only, default: 8).")
+    # baseline-specific args
+    p.add_argument("--baseline-do-sample", action="store_true", default=True,
+                    help="Whether baseline_qwen3b/baseline_qwen7b sample (default) or greedy-decode.")
     return p.parse_args()
 
 
@@ -348,12 +376,56 @@ def main():
     all_results = {}
 
     # ── Run each strategy ─────────────────────────────────────────────
+    # GSI tournament strategies (steering via blade-in-the-loop tournaments):
     strategy_generators = {
         "gsi_softmax_no_th": lambda cfg: GSISoftmaxGenerator(cfg, drafter_model, drafter_tokenizer, base_model, tokenizer, blade_model),
         #"gsi_pairwise": lambda cfg: GSIPairwiseGenerator(cfg, drafter_model, drafter_tokenizer, base_model, tokenizer, blade_model),
         "gsi_swiss_no_th": lambda cfg: GSISwissGenerator(cfg, drafter_model, drafter_tokenizer, base_model, tokenizer, blade_model),
         "gsi_elo_no_th": lambda cfg: GSIEloGenerator(cfg, drafter_model, drafter_tokenizer, base_model, tokenizer, blade_model),
         #"gsi_gumbel": lambda cfg: GSIGumbelGenerator(cfg, drafter_model, drafter_tokenizer, base_model, tokenizer, blade_model),
+
+        # Tournament matches decided directly on tilted reward (no separate
+        # draft/blade alpha-mix in the match function) — user-supplied
+        # variants living in Model_mechanics/gsi_swiss_no_match.py and
+        # Model_mechanics/gsi_elo_no_match.py.
+        "gsi_swiss_no_match": lambda cfg: GSISwissNoMatchGenerator(cfg, drafter_model, drafter_tokenizer, base_model, tokenizer, blade_model),
+        "gsi_elo_no_match": lambda cfg: GSIEloNoMatchGenerator(cfg, drafter_model, drafter_tokenizer, base_model, tokenizer, blade_model),
+
+        # ── Baselines (no GSI tournament) ──────────────────────────────
+        # Plain single-model generation, no blade steering, no speculative
+        # decoding. Qwen 2.5 3B drafter used directly as the generator.
+        "baseline_qwen3b": lambda cfg: PlainGenerator(
+            cfg, drafter_model, drafter_tokenizer, do_sample=args.baseline_do_sample,
+        ),
+        # Plain single-model generation, Qwen 2.5 7B (the SFT-merged base
+        # model that all blades are trained on) used directly as the generator.
+        "baseline_qwen7b": lambda cfg: PlainGenerator(
+            cfg, base_model, tokenizer, do_sample=args.baseline_do_sample,
+        ),
+        # Vanilla (textbook) speculative decoding: Qwen 3B drafts, Qwen 7B
+        # verifies via the standard min(1, p_verifier/p_drafter) accept
+        # rule. No blade anywhere in the accept/reject decision — this is
+        # the "what if the Blade never existed" speculative-decoding baseline.
+        "normal_spec_3b_7b": lambda cfg: NormalSpeculativeGenerator(
+            cfg, drafter_model, drafter_tokenizer, base_model, tokenizer,
+        ),
+        # Vanilla speculative decoding again, but this time the harmlessness
+        # Blade LoRA adapter itself (on top of the 7B) is the verifier/target
+        # model in the accept/reject rule — i.e. speculative decoding with
+        # the Blade as verifier, WITHOUT any GSI tournament layered on top.
+        "normal_spec_3b_blade": lambda cfg: NormalSpeculativeGenerator(
+            cfg, drafter_model, drafter_tokenizer, blade_model, tokenizer,
+        ),
+    }
+
+    # Strategies that don't use the GSI n/threshold/step config at all —
+    # kept out of the GSI-specific validation branch in SwissKnifeConfig by
+    # using a valid dummy generation_mode ("gsi_softmax_no_th") when building
+    # their per-strategy cfg below, exactly like gsi_gumbel does for its own
+    # gamma/K-only config.
+    NON_GSI_STRATEGIES = {
+        "baseline_qwen3b", "baseline_qwen7b",
+        "normal_spec_3b_7b", "normal_spec_3b_blade",
     }
 
     for strat_name in args.strategies:
@@ -382,9 +454,21 @@ def main():
         # Build strategy-specific config
         # gsi_gumbel is token-level speculative (uses gamma + K); other GSI
         # strategies are step-level (use gsi_n + gsi_max_step_tokens).
+        # normal_spec_* is also token-level speculative (uses gamma only,
+        # via the drafter/verifier loop in NormalSpeculativeGenerator).
         gumbel_kwargs = {}
         if strat_name == "gsi_gumbel":
             gumbel_kwargs = {"gamma": args.gamma, "K": args.K}
+        elif strat_name in ("normal_spec_3b_7b", "normal_spec_3b_blade"):
+            gumbel_kwargs = {"gamma": args.gamma}
+
+        # baseline_* / normal_spec_* strategies don't validate against any
+        # GSI-specific generation_mode, so pass a valid placeholder mode
+        # ("gsi_softmax_no_th") to satisfy SwissKnifeConfig.__post_init__
+        # while the actual generator class ignores generation_mode entirely.
+        cfg_generation_mode = (
+            "gsi_softmax_no_th" if strat_name in NON_GSI_STRATEGIES else strat_name
+        )
 
         cfg = SwissKnifeConfig(
             alpha=args.alpha,
@@ -392,7 +476,7 @@ def main():
             max_new_tokens=args.max_tokens,
             dtype=args.dtype,
             device=device,
-            generation_mode=strat_name,
+            generation_mode=cfg_generation_mode,
             gsi_n=args.gsi_n,
             gsi_threshold=args.gsi_threshold,
             gsi_max_step_tokens=args.gsi_max_step_tokens,
@@ -441,6 +525,7 @@ def main():
                     "elo_rounds": args.elo_rounds,
                     "elo_temperature": args.elo_temperature,
                     "max_tokens": args.max_tokens,
+                    "gamma": args.gamma if strat_name in ("normal_spec_3b_7b", "normal_spec_3b_blade") else None,
                 },
                 "avg_blade_reward": result["avg_blade_reward"],
                 "std_blade_reward": result["std_blade_reward"],
